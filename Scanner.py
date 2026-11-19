@@ -3,7 +3,7 @@ import urllib.request
 
 # ================= CONFIGURATION =================
 ODDS_API_KEY = "b4186d080fa28126c95eda2757db14be"
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1572116856108613731/6rq4I5OAfPMB1xRRylNLRh3a9xSbqXuP9NKu3F7xfhvsz-e4Mmtvu8M2QVthJQRllm-a"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1572116856108613731/6rq4I5OAfPMB1xRRy1NLRh3a9xSbqXuK"
 
 TARGET_SPORTS = [
     "basketball_nba",
@@ -15,136 +15,109 @@ TARGET_SPORTS = [
 ]
 
 MIN_ODDS = -350  # Safest heavy favorite limit
-MAX_ODDS = -200  # Minimum favorite limit
+MAX_ODDS = -140  # Expanded limit to catch more spreads, totals & favorites
+MIN_EV_PERCENT = 0.5  # Minimum positive expected value (%)
 # =================================================
 
 
-def fetch_json(url: str):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def american_to_implied(odds):
+    if odds < 0:
+        return abs(odds) / (abs(odds) + 100.0)
+    return 100.0 / (odds + 100.0)
 
 
-def american_to_implied_prob(odds: int) -> float:
-    if odds > 0:
-        return 100 / (odds + 100)
-    return abs(odds) / (abs(odds) + 100)
+def american_to_decimal(odds):
+    if odds < 0:
+        return 1.0 + (100.0 / abs(odds))
+    return 1.0 + (odds / 100.0)
 
 
-def send_to_discord(message: str):
+def send_discord(message):
     payload = json.dumps({"content": message}).encode("utf-8")
     req = urllib.request.Request(
         DISCORD_WEBHOOK_URL,
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0",
+            "User-Agent": "LadderScanner/1.0",
         },
-        method="POST",
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return resp.status
+    urllib.request.urlopen(req, timeout=15)
 
 
-def get_active_sports() -> list[str]:
-    """Checks which sports are currently in-season (costs 0 API credits)."""
-    url = f"https://api.the-odds-api.com/v4/sports/?apiKey={ODDS_API_KEY}"
-    active_data = fetch_json(url)
-    active_keys = {item["key"] for item in active_data}
-    return [sport for sport in TARGET_SPORTS if sport in active_keys]
-
-
-def scan_all_sports():
-    opportunities = []
-    active_sports = get_active_sports()
-
-    for sport in active_sports:
+def scan():
+    picks = []
+    for sport in TARGET_SPORTS:
         url = (
             f"https://api.the-odds-api.com/v4/sports/{sport}/odds/"
             f"?apiKey={ODDS_API_KEY}&regions=us,eu&markets=h2h,spreads,totals&oddsFormat=american"
         )
-        games = fetch_json(url)
+        try:
+            with urllib.request.urlopen(url, timeout=15) as resp:
+                games = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print(f"Skipping {sport}: {e}")
+            continue
 
         for game in games:
-            matchup = f"{game['away_team']} @ {game['home_team']}"
-            bookmakers = {b["key"]: b for b in game.get("bookmakers", [])}
-
-            if "fanduel" not in bookmakers or "pinnacle" not in bookmakers:
+            books = {b["key"]: b for b in game.get("bookmakers", [])}
+            fd = books.get("fanduel")
+            sharp = books.get("pinnacle")
+            if not fd or not sharp:
                 continue
 
-            fd_markets = {
-                m["key"]: m["outcomes"] for m in bookmakers["fanduel"]["markets"]
-            }
-            pin_markets = {
-                m["key"]: m["outcomes"] for m in bookmakers["pinnacle"]["markets"]
-            }
-
-            for market_key in fd_markets:
-                if market_key not in pin_markets:
+            sharp_markets = {m["key"]: m for m in sharp.get("markets", [])}
+            for m in fd.get("markets", []):
+                m_key = m["key"]
+                s_market = sharp_markets.get(m_key)
+                if not s_market:
                     continue
 
-                pin_outcomes = pin_markets[market_key]
-                fd_outcomes = fd_markets[market_key]
-                total_pin_prob = sum(
-                    american_to_implied_prob(o["price"]) for o in pin_outcomes
-                )
+                s_outcomes = s_market.get("outcomes", [])
+                if len(s_outcomes) != 2:
+                    continue
 
-                for fd_out in fd_outcomes:
-                    fd_price = fd_out["price"]
+                imp_total = sum(american_to_implied(o["price"]) for o in s_outcomes)
+                if imp_total <= 0:
+                    continue
 
-                    # Filter strictly for -350 to -200 heavy favorites
-                    if not (MIN_ODDS <= fd_price <= MAX_ODDS):
+                true_probs = {
+                    (o["name"], o.get("point")): american_to_implied(o["price"]) / imp_total
+                    for o in s_outcomes
+                }
+
+                for o in m.get("outcomes", []):
+                    price = o["price"]
+                    if not (MIN_ODDS <= price <= MAX_ODDS):
                         continue
 
-                    matching_pin = next(
-                        (
-                            p
-                            for p in pin_outcomes
-                            if p["name"] == fd_out["name"]
-                            and p.get("point") == fd_out.get("point")
-                        ),
-                        None,
-                    )
-                    if not matching_pin:
+                    t_prob = true_probs.get((o["name"], o.get("point")))
+                    if not t_prob:
                         continue
 
-                    true_prob = (
-                        american_to_implied_prob(matching_pin["price"])
-                        / total_pin_prob
-                    )
-                    decimal_odds = (100 / abs(fd_price)) + 1
-                    ev_percent = ((true_prob * decimal_odds) - 1) * 100
+                    dec = american_to_decimal(price)
+                    ev_pct = ((t_prob * dec) - 1.0) * 100.0
+                    if ev_pct >= MIN_EV_PERCENT:
+                        point_str = f" {o['point']}" if o.get("point") is not None else ""
+                        label = sport.split("_")[-1].upper()
+                        picks.append(
+                            (
+                                ev_pct,
+                                f"**[{label}] {game['away_team']} @ {game['home_team']}**\n"
+                                f"Pick: `{o['name']}{point_str}` ({m_key.upper()}) | "
+                                f"FD: **{price}** | Win Prob: **{t_prob*100:.1f}%** | EV: **+{ev_pct:.2f}%**",
+                            )
+                        )
 
-                    # Only alert if FanDuel's odds beat the sharp true probability (+EV)
-                    if ev_percent > 0:
-                        point_str = f" {fd_out['point']}" if "point" in fd_out else ""
-                        opportunities.append({
-                            "sport": sport.split("_")[-1].upper(),
-                            "matchup": matchup,
-                            "market": market_key.upper(),
-                            "pick": f"{fd_out['name']}{point_str}",
-                            "odds": fd_price,
-                            "win_prob": round(true_prob * 100, 1),
-                            "ev": round(ev_percent, 2),
-                        })
-
-    opportunities.sort(key=lambda x: x["ev"], reverse=True)
-    return opportunities
+    picks.sort(key=lambda x: x[0], reverse=True)
+    if picks:
+        top_lines = "\n\n".join(p[1] for p in picks[:8])
+        send_discord(f"🎯 **Ladder Scanner (+EV Picks: {MIN_ODDS} to {MAX_ODDS})**\n\n{top_lines}")
+    else:
+        send_discord(
+            f"✅ **Ladder Scan Complete:** No +EV picks in the `{MIN_ODDS}` to `{MAX_ODDS}` range right now."
+        )
 
 
 if __name__ == "__main__":
-    picks = scan_all_sports()
-    if not picks:
-        print("No +EV picks in the -350 to -200 range right now.")
-    else:
-        lines = ["**🎯 Daily FanDuel Ladder Locks (-350 to -200 +EV)**\n"]
-        for p in picks[:10]:
-            lines.append(
-                f"• **[{p['sport']}] {p['matchup']}**\n"
-                f"  Pick: `{p['pick']}` ({p['market']}) | FD: **{p['odds']}** | "
-                f"Win Prob: **{p['win_prob']}%** | EV: **+{p['ev']}%**"
-            )
-        report = "\n".join(lines)
-        print(report)
-        send_to_discord(report)
-        print("Sent to Discord!")
+    scan()
