@@ -3,7 +3,7 @@ import urllib.request
 
 # ================= CONFIGURATION =================
 ODDS_API_KEY = "b4186d080fa28126c95eda2757db14be"
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1572116856108613731/6rq4I5OAfPMB1xRRy1NLRh3a9xSbqXuK"
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1572116856108613731/6rq4I5OAfPMB1xRRylNLRh3a9xSbqXuP9NKu3F7xfhvsz-e4Mmtvu8M2QVthJQRllm-a"
 
 TARGET_SPORTS = [
     "basketball_nba",
